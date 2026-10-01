@@ -1,0 +1,300 @@
+{
+ "bench": "autoclave",
+ "adapter": "adapters.mine:MySolver",
+ "budget_scale": 1.0,
+ "records": [
+  {
+   "name": "autoclave-01",
+   "family": "standard",
+   "shifted": false,
+   "size": 30,
+   "digest": "84febd132f9016fb",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.001059,
+     8648
+    ],
+    [
+     0.017143,
+     6710
+    ],
+    [
+     0.051752,
+     6312
+    ],
+    [
+     0.106014,
+     6246
+    ]
+   ],
+   "checkpoint_costs": [
+    6246,
+    6246,
+    6246,
+    6246
+   ],
+   "final_cost": 6246,
+   "accepted": 5,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.056
+  },
+  {
+   "name": "autoclave-02",
+   "family": "standard",
+   "shifted": false,
+   "size": 50,
+   "digest": "d0d63945a629c827",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.001342,
+     15183
+    ],
+    [
+     0.158126,
+     10587
+    ]
+   ],
+   "checkpoint_costs": [
+    10587,
+    10587,
+    10587,
+    10587
+   ],
+   "final_cost": 10587,
+   "accepted": 3,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.015
+  },
+  {
+   "name": "autoclave-03",
+   "family": "standard",
+   "shifted": false,
+   "size": 70,
+   "digest": "9522039efe3eb917",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.002257,
+     16390
+    ],
+    [
+     0.553053,
+     12865
+    ],
+    [
+     1.65421,
+     12175
+    ],
+    [
+     3.204418,
+     12089
+    ],
+    [
+     3.806073,
+     11983
+    ],
+    [
+     3.877188,
+     11981
+    ]
+   ],
+   "checkpoint_costs": [
+    16390,
+    12865,
+    12175,
+    11981
+   ],
+   "final_cost": 11981,
+   "accepted": 7,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.021
+  },
+  {
+   "name": "autoclave-04",
+   "family": "standard",
+   "shifted": false,
+   "size": 90,
+   "digest": "9200ac3cf73ab71c",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.003339,
+     22595
+    ],
+    [
+     0.5539,
+     17072
+    ],
+    [
+     2.205804,
+     16735
+    ],
+    [
+     3.467137,
+     16501
+    ],
+    [
+     4.73512,
+     16214
+    ]
+   ],
+   "checkpoint_costs": [
+    22595,
+    17072,
+    16735,
+    16214
+   ],
+   "final_cost": 16214,
+   "accepted": 6,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.022
+  },
+  {
+   "name": "autoclave-05",
+   "family": "tight-heavy",
+   "shifted": true,
+   "size": 40,
+   "digest": "5d3bfc97533735ac",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.001224,
+     12275
+    ],
+    [
+     0.087559,
+     11486
+    ],
+    [
+     0.11571,
+     11401
+    ],
+    [
+     0.146803,
+     11323
+    ],
+    [
+     0.277613,
+     11179
+    ],
+    [
+     0.3678,
+     11119
+    ],
+    [
+     0.458115,
+     11047
+    ]
+   ],
+   "checkpoint_costs": [
+    11323,
+    11047,
+    11047,
+    11047
+   ],
+   "final_cost": 11047,
+   "accepted": 8,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.023
+  },
+  {
+   "name": "autoclave-06",
+   "family": "tight-heavy",
+   "shifted": true,
+   "size": 80,
+   "digest": "fd165bac509dfd83",
+   "adapter": "adapters.mine:MySolver",
+   "budget_s": 5.0,
+   "history": [
+    [
+     0.001948,
+     31329
+    ],
+    [
+     1.102662,
+     23338
+    ],
+    [
+     1.654236,
+     23151
+    ],
+    [
+     2.20498,
+     22707
+    ],
+    [
+     2.755636,
+     21900
+    ],
+    [
+     3.112261,
+     21589
+    ],
+    [
+     3.480961,
+     21166
+    ]
+   ],
+   "checkpoint_costs": [
+    31329,
+    31329,
+    22707,
+    21166
+   ],
+   "final_cost": 21166,
+   "accepted": 8,
+   "rejected": 0,
+   "reasons": [],
+   "overrun": false,
+   "crashed": false,
+   "error": null,
+   "wall_s": 5.024
+  }
+ ],
+ "points": {
+  "scores": {
+   "autoclave-01": 1.0,
+   "autoclave-02": 1.0,
+   "autoclave-03": 0.8088570724839725,
+   "autoclave-04": 0.7729262848778972,
+   "autoclave-05": 0.9758695652173914,
+   "autoclave-06": 0.6097480897148194
+  },
+  "family_means": {
+   "standard": 0.8954458393404674,
+   "tight-heavy": 0.7928088274661054
+  },
+  "robustness_halved": false,
+  "quality": 60.286345143430935,
+  "robustness": 15.856176549322107,
+  "engineering": 10.0,
+  "total": 86.14252169275304
+ }
+}
