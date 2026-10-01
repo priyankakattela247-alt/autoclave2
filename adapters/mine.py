@@ -1,755 +1,374 @@
 """
-Strong Autoclave Queue solver.
+Autoclave Queue solver  ->  adapters/mine.py
 
-Strategy:
-1. Generate several good initial permutations.
-2. Submit the best immediately.
-3. Insertion local search:
-      remove one batch -> try inserting it at every position.
-4. Destroy + repair:
-      remove several batches -> greedily reinsert them.
-5. Randomized restarts / perturbations to escape local optima.
-6. Occasional pair-swap descent.
-7. Stay within the benchmark's ~5 second budget.
+Strategy (tuned for the anytime scoring at 5% / 20% / 50% / 100% of 5 s):
 
-The evaluator expects:
-    {"order": [all batch ids exactly once]}
+1. Submit EDD immediately so a valid plan always exists.
+2. Build several release/setup-aware dispatch schedules and keep the best.
+3. Run simulated annealing in four time slices that END at the scoring
+   checkpoints.  Each slice restarts from the incumbent and cools to ~0, so
+   the best-so-far at every checkpoint is a freshly polished local optimum.
+4. Moves: block insertion (1-3 batches), swap.  Every move only re-simulates
+   the changed window plus the tail, and the tail is cut short when
+   (a) a release date re-synchronises the schedule with the old one, or
+   (b) a lower bound already exceeds the acceptance threshold.
 """
-
-from adapter import Solver, cost_of
-
 import math
 import random
 import time
+from itertools import permutations
 
+from adapter import Solver
 
-# The benchmark gives 5 seconds.
-# Leave a small safety margin for submission/evaluator overhead.
-TIME_LIMIT = 4.85
+try:
+    from adapter import cost_of
+except Exception:  # pragma: no cover
+    cost_of = None
 
+# ---- tunables ---------------------------------------------------------------
+TIME_LIMIT = 4.6                    # stop searching here (budget is 5.0 s)
+SEG_ENDS = (0.22, 0.95, 2.45)       # slice ends just before the 5%/20%/50% marks
+SEG_TEMPS = ((0.02, 0.002), (0.03, 0.003), (0.03, 0.003), (0.05, 0.002))
+EMIT_GAP = 0.05                     # min seconds between intermediate submits
+NEG = -1e18
 
-# ============================================================
-# BASIC CONSTRUCTION HEURISTICS
-# ============================================================
-
-def order_edd(instance):
-    """Earliest Due Date."""
-    n = instance.size
-    return sorted(
-        range(n),
-        key=lambda b: (
-            instance.due[b],
-            instance.release[b],
-            b
-        )
-    )
-
-
-def order_release(instance):
-    """
-    Release-time driven ordering.
-
-    Particularly useful for the shifted/tight instances where
-    release times contain useful information about the hidden
-    construction sequence.
-    """
-    n = instance.size
-    return sorted(
-        range(n),
-        key=lambda b: (
-            instance.release[b],
-            instance.due[b],
-            -instance.weight[b],
-            b
-        )
-    )
-
-
-def order_mixed(instance):
-    """Mix release time and due date."""
-    n = instance.size
-
-    return sorted(
-        range(n),
-        key=lambda b: (
-            instance.release[b] + instance.due[b],
-            instance.due[b],
-            -instance.weight[b],
-            b
-        )
-    )
-
-
-def order_mdd(instance, weighted=False):
-    """
-    Modified Due Date style dispatching rule.
-
-    At every step, choose the batch with the smallest projected
-    priority after considering:
-        - current machine time
-        - release time
-        - setup time
-        - processing time
-        - due date
-    """
-    n = instance.size
-
-    p = instance.proc
-    r = instance.release
-    d = instance.due
-    w = instance.weight
-    f = instance.fam
-    setup = instance.setup
-
-    remaining = set(range(n))
-    order = []
-
-    current_time = 0
-    previous_family = None
-
-    while remaining:
-
-        best_batch = None
-        best_score = float("inf")
-
-        for b in remaining:
-
-            changeover = (
-                0
-                if previous_family is None
-                else setup[previous_family][f[b]]
-            )
-
-            start = max(
-                current_time + changeover,
-                r[b]
-            )
-
-            finish = start + p[b]
-
-            if weighted:
-                # Weighted modified due date.
-                score = max(finish, d[b]) / (w[b] + 0.5)
-            else:
-                score = max(finish, d[b])
-
-            # Slightly discourage expensive family changes.
-            score += 0.20 * changeover
-
-            if score < best_score:
-                best_score = score
-                best_batch = b
-
-        b = best_batch
-
-        changeover = (
-            0
-            if previous_family is None
-            else setup[previous_family][f[b]]
-        )
-
-        current_time = (
-            max(current_time + changeover, r[b])
-            + p[b]
-        )
-
-        previous_family = f[b]
-        order.append(b)
-        remaining.remove(b)
-
-    return order
-
-
-# ============================================================
-# INSERTION LOCAL SEARCH
-# ============================================================
-
-def insertion_descent(instance, order, deadline):
-    """
-    Best-improvement insertion search.
-
-    The original version stopped at the first improving move.
-    Here we inspect the most expensive/tardy batches and choose
-    the BEST insertion position for the batch before accepting it.
-
-    This is slower per pass, but much less greedy and generally
-    more useful on the 70-90 batch instances.
-    """
-    order = list(order)
-    n = len(order)
-    current_cost = cost_of(instance, order)
-
-    p = instance.proc
-    r = instance.release
-    d = instance.due
-    w = instance.weight
-    f = instance.fam
-    setup = instance.setup
-
-    # A small beam of problematic positions keeps the 5 s budget safe.
-    beam = min(n, max(12, n // 3))
-
-    while time.perf_counter() < deadline:
-        contribution = [0] * n
-
-        current_time = 0
-        previous_family = None
-
-        for pos, b in enumerate(order):
-            if previous_family is None:
-                start = r[b]
-            else:
-                start = max(
-                    current_time + setup[previous_family][f[b]],
-                    r[b],
-                )
-
-            current_time = start + p[b]
-            contribution[pos] = w[b] * max(0, current_time - d[b])
-            previous_family = f[b]
-
-        # Tardy/high-weight batches first.  Add a mild family/setup signal
-        # so batches sitting at costly family boundaries are also considered.
-        positions = sorted(
-            range(n),
-            key=lambda i: (
-                contribution[i],
-                p[order[i]],
-                d[order[i]],
-            ),
-            reverse=True,
-        )[:beam]
-
-        best_move = None
-        best_delta = 0
-
-        for i in positions:
-            if time.perf_counter() >= deadline:
-                break
-
-            batch = order[i]
-            reduced = order[:i] + order[i + 1:]
-            batch_family = f[batch]
-
-            # Candidate positions near the same family first, then all
-            # remaining positions.  This helps reduce setup changes.
-            family_positions = []
-            for j in range(len(reduced) + 1):
-                left = reduced[j - 1] if j > 0 else None
-                right = reduced[j] if j < len(reduced) else None
-
-                if (
-                    (left is not None and f[left] == batch_family)
-                    or
-                    (right is not None and f[right] == batch_family)
-                ):
-                    family_positions.append(j)
-
-            # Also inspect positions immediately before/after high-impact
-            # jobs; these often matter more than arbitrary positions.
-            important_positions = set(family_positions)
-
-            for j in range(max(0, i - 4), min(len(reduced) + 1, i + 5)):
-                important_positions.add(j)
-
-            # Every 3rd pass / when beam is small, sample a few extra positions.
-            for j in range(0, len(reduced) + 1, max(1, n // 12)):
-                important_positions.add(j)
-
-            candidate_positions = sorted(
-                important_positions,
-                key=lambda j: (
-                    0
-                    if j in important_positions and (
-                        j in family_positions
-                    )
-                    else 1,
-                    abs(j - i),
-                ),
-            )
-
-            # Always include the ends.
-            if 0 not in important_positions:
-                candidate_positions.append(0)
-            if len(reduced) not in important_positions:
-                candidate_positions.append(len(reduced))
-
-            seen = set()
-
-            for j in candidate_positions:
-                if j in seen:
-                    continue
-                seen.add(j)
-
-                # Same position as before removal.
-                if j == i:
-                    continue
-
-                candidate = reduced[:j] + [batch] + reduced[j:]
-                candidate_cost = cost_of(instance, candidate)
-                delta = current_cost - candidate_cost
-
-                if delta > best_delta:
-                    best_delta = delta
-                    best_move = candidate
-
-        if best_move is None:
-            break
-
-        order = best_move
-        current_cost -= best_delta
-
-    return order, current_cost
-
-
-# ============================================================
-# SWAP LOCAL SEARCH
-# ============================================================
-
-def swap_descent(instance, order, deadline):
-    """
-    Additional neighborhood:
-
-        swap batch i with batch j
-
-    Insertion search already covers many swaps, but explicit
-    pair swaps can escape some insertion-local optima.
-    """
-
-    order = list(order)
-    n = len(order)
-
-    current_cost = cost_of(instance, order)
-
-    while time.perf_counter() < deadline:
-
-        improved = False
-
-        for i in range(n - 1):
-
-            for j in range(i + 1, n):
-
-                if time.perf_counter() >= deadline:
-                    return order, current_cost
-
-                order[i], order[j] = order[j], order[i]
-
-                new_cost = cost_of(
-                    instance,
-                    order
-                )
-
-                if new_cost < current_cost:
-
-                    current_cost = new_cost
-                    improved = True
-                    break
-
-                # Undo unsuccessful swap.
-                order[i], order[j] = order[j], order[i]
-
-            if improved:
-                break
-
-        if not improved:
-            break
-
-    return order, current_cost
-
-
-# ============================================================
-# DESTROY + REPAIR
-# ============================================================
-
-def destroy_repair(instance, order, rng, deadline=None):
-    """
-    Large-neighborhood search with regret-2 repair.
-
-    Compared with simple random reinsertion, regret repair asks:
-        "Which removed batch will become hardest to place later?"
-
-    That tends to preserve difficult jobs/family transitions and is
-    especially useful on the tight-heavy instances.
-    """
-    n = len(order)
-
-    q = rng.randint(
-        max(4, n // 16),
-        min(10, max(5, n // 8)),
-    )
-
-    p = instance.proc
-    r = instance.release
-    d = instance.due
-    w = instance.weight
-    f = instance.fam
-    setup = instance.setup
-
-    # --------------------------------------------------------
-    # Score current positions by weighted tardiness contribution.
-    # --------------------------------------------------------
-    contribution = [0] * n
-
-    current_time = 0
-    previous_family = None
-
-    for pos, b in enumerate(order):
-        if previous_family is None:
-            start = r[b]
-        else:
-            start = max(
-                current_time + setup[previous_family][f[b]],
-                r[b],
-            )
-
-        current_time = start + p[b]
-        contribution[pos] = w[b] * max(0, current_time - d[b])
-        previous_family = f[b]
-
-    # Remove a mixture of:
-    #   - one clearly problematic batch
-    #   - random batches
-    # This gives exploration without destroying all structure.
-    bad_positions = sorted(
-        range(n),
-        key=lambda i: contribution[i],
-        reverse=True,
-    )
-
-    target_pool = bad_positions[:max(10, n // 4)]
-
-    removed_positions = {
-        rng.choice(target_pool)
-    }
-
-    while len(removed_positions) < q:
-        removed_positions.add(rng.randrange(n))
-
-    remaining = list(order)
-    removed = []
-
-    for i in sorted(removed_positions, reverse=True):
-        removed.append(remaining.pop(i))
-
-    # --------------------------------------------------------
-    # Regret-2 repair.
-    # --------------------------------------------------------
-    while removed:
-        if deadline is not None and time.perf_counter() >= deadline:
-            # Keep the solution valid even if time expires.
-            for batch in removed:
-                remaining.append(batch)
-            return remaining
-
-        chosen_batch = None
-        chosen_position = 0
-        chosen_regret = -float("inf")
-        chosen_best_cost = float("inf")
-
-        for batch in removed:
-            best_cost = float("inf")
-            second_cost = float("inf")
-            best_pos = 0
-
-            for j in range(len(remaining) + 1):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
-
-                candidate = (
-                    remaining[:j]
-                    + [batch]
-                    + remaining[j:]
-                )
-
-                candidate_cost = cost_of(instance, candidate)
-
-                if candidate_cost < best_cost:
-                    second_cost = best_cost
-                    best_cost = candidate_cost
-                    best_pos = j
-                elif candidate_cost < second_cost:
-                    second_cost = candidate_cost
-
-            regret = second_cost - best_cost
-
-            # Highest regret gets inserted first.
-            if (
-                regret > chosen_regret
-                or (
-                    regret == chosen_regret
-                    and best_cost < chosen_best_cost
-                )
-            ):
-                chosen_regret = regret
-                chosen_batch = batch
-                chosen_position = best_pos
-                chosen_best_cost = best_cost
-
-        removed.remove(chosen_batch)
-        remaining.insert(chosen_position, chosen_batch)
-
-    return remaining
-
-
-# ============================================================
-# SOLVER
-# ============================================================
 
 class MySolver(Solver):
-
     def solve(self, instance, submit_candidate):
+        return _Run(instance, submit_candidate).run()
 
-        start_time = time.perf_counter()
 
-        # ----------------------------------------------------
-        # Initial deadline.
-        # ----------------------------------------------------
+class _Run:
+    def __init__(self, inst, submit):
+        self.t0 = time.perf_counter()
+        self.inst = inst
+        self.submit = submit
+        n = self.n = int(inst.size)
+        fam = [int(x) for x in inst.fam]
+        self.proc = [inst.proc[b] for b in range(n)]
+        self.rel = [inst.release[b] for b in range(n)]
+        self.due = [inst.due[b] for b in range(n)]
+        self.w = [inst.weight[b] for b in range(n)]
+        self.J = [(self.rel[b], self.proc[b], self.due[b], self.w[b]) for b in range(n)]
+        su = inst.setup
+        # ST[a][b] = changeover from batch a to batch b; row n = "nothing yet" (0)
+        self.ST = [[su[fam[a]][fam[b]] for b in range(n)] for a in range(n)] + [[0] * n]
+        self.pbar = max(sum(self.proc) / n, 1e-9)
+        nz = [su[f][g] for f in range(len(su)) for g in range(len(su)) if f != g]
+        sb = (sum(nz) / len(nz)) if nz else 0
+        self.sbar = sb if sb > 0 else 1.0
+        self.rng = random.Random(20240601)
+        self.W = max(3, n // 6)
+        self.last_emit = -1.0
+        self.pending = False
+        self.best_cost = None
+        self.best_order = None
 
-        deadline = start_time + TIME_LIMIT
+    # ---- helpers -------------------------------------------------------------
+    def now(self):
+        return time.perf_counter() - self.t0
 
-        # Deterministic random generator per instance.
+    def emit(self, order):
         try:
-            seed = int(instance.digest, 16)
+            self.submit_candidate_safe(order)
         except Exception:
-            seed = 123456789
-
-        rng = random.Random(seed)
-
-        n = instance.size
-
-        # ----------------------------------------------------
-        # Generate several structurally different starting
-        # solutions.
-        # ----------------------------------------------------
-
-        initial_orders = [
-            order_edd(instance),
-            order_release(instance),
-            order_mixed(instance),
-            order_mdd(instance, weighted=False),
-            order_mdd(instance, weighted=True),
-        ]
-
-        # ----------------------------------------------------
-        # Choose cheapest initial order.
-        #
-        # We do NOT spend seconds improving before submitting.
-        # The first benchmark checkpoint matters.
-        # ----------------------------------------------------
-
-        best_order = min(
-            initial_orders,
-            key=lambda x: cost_of(instance, x)
-        )
-
-        best_cost = cost_of(
-            instance,
-            best_order
-        )
-
-        # ----------------------------------------------------
-        # Submit first solution immediately.
-        # ----------------------------------------------------
-
-        receipt = submit_candidate({
-            "order": best_order
-        })
-
-        if not receipt.get("accepted", False):
-            # Still keep solving; the order itself is valid.
             pass
 
-        # Use evaluator's remaining budget if available.
-        remaining_s = receipt.get(
-            "remaining_s",
-            TIME_LIMIT
-        )
+    def submit_candidate_safe(self, order):
+        self.submit({"order": [int(b) for b in order]})
 
-        deadline = min(
-            start_time + TIME_LIMIT,
-            time.perf_counter() + max(
-                0.0,
-                remaining_s - 0.06
-            )
-        )
+    def full_cost(self, order):
+        J = self.J; ST = self.ST
+        t = NEG; prev = self.n; td = 0
+        for b in order:
+            rb, pb, db, wb = J[b]
+            s = t + ST[prev][b]
+            if s < rb:
+                s = rb
+            t = s + pb
+            x = t - db
+            if x > 0:
+                td += wb * x
+            prev = b
+        return 4 * t + td
 
-        # ----------------------------------------------------
-        # Improve all useful starting regions.
-        # ----------------------------------------------------
+    def load(self, order):
+        """Make `order` the current solution and rebuild the incremental caches."""
+        n = self.n; J = self.J; ST = self.ST
+        self.cur = list(order)
+        fin = [0] * n; T = [0] * (n + 1); Prem = [0] * (n + 1)
+        t = NEG; prev = n; td = 0
+        for p, b in enumerate(self.cur):
+            rb, pb, db, wb = J[b]
+            s = t + ST[prev][b]
+            if s < rb:
+                s = rb
+            t = s + pb
+            x = t - db
+            if x > 0:
+                td += wb * x
+            fin[p] = t; T[p + 1] = td; prev = b
+        for p in range(n - 1, -1, -1):
+            Prem[p] = Prem[p + 1] + J[self.cur[p]][1]
+        self.fin = fin; self.T = T; self.Prem = Prem
+        self.cost = 4 * t + td
 
-        for initial in initial_orders:
+    def consider(self, order, cost=None):
+        if cost is None:
+            cost = self.full_cost(order)
+        if self.best_cost is None or cost < self.best_cost:
+            self.best_cost = cost
+            self.best_order = list(order)
+            self.pending = True
 
-            if time.perf_counter() >= deadline:
-                break
+    # ---- constructive heuristics ---------------------------------------------
+    def construct(self, kind, k1=1.0, k2=1.0):
+        n = self.n; J = self.J; ST = self.ST
+        left = list(range(n))
+        t = 0; prev = n; out = []
+        pbar = self.pbar; sbar = self.sbar
+        exp = math.exp
+        while left:
+            row = ST[prev]
+            best_b = -1; best_v = None
+            for b in left:
+                rb, pb, db, wb = J[b]
+                s = t + row[b]
+                if s < rb:
+                    s = rb
+                c = s + pb
+                if kind == 0:      # ATCS-style index with release/setup awareness
+                    sl = db - c
+                    if sl < 0:
+                        sl = 0
+                    v = -(wb / pb) * exp(-sl / (k1 * pbar)) * exp(-(s - t) / (k2 * sbar))
+                elif kind == 1:    # earliest completion
+                    v = c + db * 1e-6
+                else:              # cheapest cost increment per unit of work
+                    late = c - db
+                    v = (4 * (c - t) + (wb * late if late > 0 else 0)) / pb
+                if best_v is None or v < best_v:
+                    best_v = v; best_b = b
+            left.remove(best_b)
+            out.append(best_b)
+            s = t + row[best_b]
+            if s < J[best_b][0]:
+                s = J[best_b][0]
+            t = s + J[best_b][1]
+            prev = best_b
+        return out
 
-            # Give each start some search time.
-            local_deadline = min(
-                deadline,
-                time.perf_counter() + 0.70
-            )
-
-            candidate = list(initial)
-
-            candidate, candidate_cost = insertion_descent(
-                instance,
-                candidate,
-                local_deadline
-            )
-
-            if candidate_cost < best_cost:
-
-                receipt = submit_candidate({
-                    "order": candidate
-                })
-
-                if receipt.get("accepted", True):
-                    best_order = list(candidate)
-                    best_cost = candidate_cost
-
-                    remaining_s = receipt.get(
-                        "remaining_s",
-                        TIME_LIMIT
-                    )
-
-                    deadline = min(
-                        deadline,
-                        time.perf_counter()
-                        + max(0.0, remaining_s - 0.06)
-                    )
-
-        # ----------------------------------------------------
-        # Main iterated local search.
-        # ----------------------------------------------------
-
-        iteration = 0
-
-        while time.perf_counter() < deadline:
-
-            iteration += 1
-
-            # ------------------------------------------------
-            # Every few iterations, use pair-swap refinement.
-            # ------------------------------------------------
-
-            if iteration % 4 == 0:
-
-                swap_deadline = min(
-                    deadline,
-                    time.perf_counter() + 0.26
-                )
-
-                candidate, candidate_cost = swap_descent(
-                    instance,
-                    best_order,
-                    swap_deadline
-                )
-
+    # ---- simulated annealing slice -------------------------------------------
+    def anneal(self, t_end, f0, f1):
+        n = self.n
+        J = self.J; ST = self.ST
+        order = self.cur; fin = self.fin; T = self.T; Prem = self.Prem
+        cost = self.cost
+        best_cost = self.best_cost; best_order = self.best_order
+        pending = self.pending
+        rand = self.rng.random
+        log = math.log; exp = math.exp
+        clock = time.perf_counter
+        W = self.W; W2 = 2 * W + 1
+        n1 = n - 1
+        t0 = self.t0
+        temp0 = f0 * self.dbar; temp1 = f1 * self.dbar
+        if temp0 <= 0:
+            temp0 = temp1 = 1e-9
+        rl = log(temp1 / temp0)
+        start = clock() - t0
+        span = max(t_end - start, 1e-6)
+        temp = temp0
+        it = 0
+        while True:
+            it += 1
+            if not (it & 15):
+                now = clock() - t0
+                if now >= t_end:
+                    break
+                temp = temp0 * exp(rl * (now - start) / span)
+                if pending and now - self.last_emit >= EMIT_GAP:
+                    self.emit(best_order)
+                    self.last_emit = now
+                    pending = False
+            r = rand()
+            if r < 0.25:                                   # swap
+                i = int(rand() * n)
+                if rand() < 0.7:
+                    j = i + int(rand() * W2) - W
+                    if j < 0 or j >= n:
+                        continue
+                else:
+                    j = int(rand() * n)
+                if i == j:
+                    continue
+                if i > j:
+                    i, j = j, i
+                lo = i; hi = j
+                seg = [order[j]]
+                if j - i > 1:
+                    seg.extend(order[i + 1:j])
+                seg.append(order[i])
+            else:                                          # block insertion
+                L = 1 if r < 0.75 else (2 if r < 0.90 else 3)
+                m = n - L
+                i = int(rand() * (m + 1))
+                if rand() < 0.7:
+                    j = i + int(rand() * W2) - W
+                    if j < 0 or j > m:
+                        continue
+                else:
+                    j = int(rand() * (m + 1))
+                if j == i:
+                    continue
+                if j > i:
+                    lo = i; hi = j + L - 1
+                    seg = order[i + L:j + L]
+                    seg.extend(order[i:i + L])
+                else:
+                    lo = j; hi = i + L - 1
+                    seg = order[i:i + L]
+                    seg.extend(order[j:i])
+            # ---- evaluate (suffix only) ----
+            thr = cost - temp * log(1.0 - rand())
+            if lo:
+                t = fin[lo - 1]; prev = order[lo - 1]
             else:
+                t = NEG; prev = n
+            td = T[lo]
+            for b in seg:
+                rb, pb, db, wb = J[b]
+                s = t + ST[prev][b]
+                if s < rb:
+                    s = rb
+                t = s + pb
+                x = t - db
+                if x > 0:
+                    td += wb * x
+                prev = b
+            if td + 4 * (t + Prem[hi + 1]) > thr:
+                continue
+            ok = True
+            new_cost = 0
+            for p in range(hi + 1, n):
+                b = order[p]
+                rb, pb, db, wb = J[b]
+                s = t + ST[prev][b]
+                if s < rb:
+                    s = rb
+                t = s + pb
+                x = t - db
+                if x > 0:
+                    td += wb * x
+                if t == fin[p]:                            # re-synchronised
+                    new_cost = 4 * fin[n1] + td + T[n] - T[p + 1]
+                    break
+                if td + 4 * (t + Prem[p + 1]) > thr:
+                    ok = False
+                    break
+                prev = b
+            else:
+                new_cost = 4 * t + td
+            if not ok or new_cost > thr:
+                continue
+            # ---- accept: apply move and refresh caches from lo ----
+            order[lo:hi + 1] = seg
+            if lo:
+                t = fin[lo - 1]; prev = order[lo - 1]
+            else:
+                t = NEG; prev = n
+            td = T[lo]
+            for p in range(lo, n):
+                b = order[p]
+                rb, pb, db, wb = J[b]
+                s = t + ST[prev][b]
+                if s < rb:
+                    s = rb
+                t = s + pb
+                x = t - db
+                if x > 0:
+                    td += wb * x
+                fin[p] = t; T[p + 1] = td; prev = b
+            for p in range(hi, lo, -1):
+                Prem[p] = Prem[p + 1] + J[order[p]][1]
+            cost = 4 * t + td
+            if cost < best_cost:
+                best_cost = cost
+                best_order = order[:]
+                pending = True
+        self.cost = cost
+        self.best_cost = best_cost; self.best_order = best_order
+        self.pending = pending
+        self.iters = getattr(self, "iters", 0) + it
 
-                # ------------------------------------------------
-                # Otherwise perform a destroy/repair kick.
-                # ------------------------------------------------
+    def calibrate(self):
+        """Typical uphill move size, used to scale temperatures."""
+        n = self.n
+        base = self.best_order
+        c0 = self.best_cost
+        rng = self.rng
+        ups = []
+        for _ in range(250):
+            i = rng.randrange(n); j = rng.randrange(n)
+            if i == j:
+                continue
+            o = base[:]
+            o.insert(j, o.pop(i))
+            d = self.full_cost(o) - c0
+            if d > 0:
+                ups.append(d)
+        if not ups:
+            return max(1.0, abs(c0) * 0.001)
+        ups.sort()
+        return ups[len(ups) // 2]
 
-                candidate = destroy_repair(
-                    instance,
-                    best_order,
-                    rng,
-                    deadline=min(deadline, time.perf_counter() + 0.28),
-                )
+    # ---- main ------------------------------------------------------------------
+    def run(self):
+        n = self.n
+        due = self.due; rel = self.rel
+        edd = sorted(range(n), key=lambda b: (due[b], rel[b], b))
+        self.emit(edd)
+        self.consider(edd)
+        self.pending = False
+        if n <= 1:
+            return {"order": edd}
+        if n <= 7:
+            best = min(permutations(range(n)), key=self.full_cost)
+            self.emit(best)
+            return {"order": list(best)}
 
-                # Follow it with insertion descent.
-                candidate_deadline = min(
-                    deadline,
-                    time.perf_counter() + 0.35
-                )
+        self.consider(sorted(range(n), key=lambda b: (rel[b], due[b], b)))
+        cons = [self.construct(1), self.construct(2)]
+        for k1 in (1.0, 3.0, 10.0, 30.0):
+            for k2 in (0.3, 1.0, 3.0, 10.0):
+                if self.now() > SEG_ENDS[0] * 0.45:
+                    break
+                cons.append(self.construct(0, k1, k2))
+        for o in cons:
+            self.consider(o)
+        self.emit(self.best_order)
+        self.last_emit = self.now()
+        self.pending = False
 
-                candidate, candidate_cost = (
-                    insertion_descent(
-                        instance,
-                        candidate,
-                        candidate_deadline
-                    )
-                )
+        self.dbar = self.calibrate()
+        ends = list(SEG_ENDS) + [TIME_LIMIT]
+        for end, (f0, f1) in zip(ends, SEG_TEMPS):
+            end = min(end, TIME_LIMIT)
+            if self.now() >= end - 0.01:
+                continue
+            self.load(self.best_order)
+            self.anneal(end, f0, f1)
+            if self.pending:
+                self.emit(self.best_order)
+                self.last_emit = self.now()
+                self.pending = False
 
-            # ------------------------------------------------
-            # New best.
-            # ------------------------------------------------
-
-            if candidate_cost < best_cost:
-
-                receipt = submit_candidate({
-                    "order": candidate
-                })
-
-                if receipt.get("accepted", True):
-
-                    best_order = list(candidate)
-                    best_cost = candidate_cost
-
-                    remaining_s = receipt.get(
-                        "remaining_s",
-                        TIME_LIMIT
-                    )
-
-                    # Refresh deadline using evaluator time.
-                    deadline = min(
-                        deadline,
-                        time.perf_counter()
-                        + max(0.0, remaining_s - 0.06)
-                    )
-
-            # ------------------------------------------------
-            # Occasionally restart from a different heuristic.
-            # ------------------------------------------------
-
-            elif iteration % 10 == 0:
-
-                restart = list(
-                    initial_orders[
-                        iteration % len(initial_orders)
-                    ]
-                )
-
-                # Small random perturbation.
-                for _ in range(
-                    max(2, n // 25)
-                ):
-
-                    i = rng.randrange(n)
-                    j = rng.randrange(n)
-
-                    restart[i], restart[j] = (
-                        restart[j],
-                        restart[i]
-                    )
-
-                restart_deadline = min(
-                    deadline,
-                    time.perf_counter() + 0.25
-                )
-
-                restart, restart_cost = (
-                    insertion_descent(
-                        instance,
-                        restart,
-                        restart_deadline
-                    )
-                )
-
-                if restart_cost < best_cost:
-
-                    receipt = submit_candidate({
-                        "order": restart
-                    })
-
-                    if receipt.get("accepted", True):
-                        best_order = list(restart)
-                        best_cost = restart_cost
-
-        # ----------------------------------------------------
-        # Final valid best solution.
-        # ----------------------------------------------------
-
-        return {
-            "order": best_order
-        }
+        best = self.best_order
+        if cost_of is not None:
+            try:
+                if cost_of(self.inst, edd) < cost_of(self.inst, best):
+                    best = edd
+                    self.emit(best)
+            except Exception:
+                pass
+        return {"order": [int(b) for b in best]}
